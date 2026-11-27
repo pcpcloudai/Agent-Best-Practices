@@ -3,9 +3,9 @@
 
 ## Executive Summary
 
-AI agent platforms depend on many credentials: model endpoints, search services, enterprise APIs, MCP servers, databases, and certificates. Without a clear secrets strategy, these credentials spread across code, container images, environment variables, and pipelines, which increases the risk of leakage and makes rotation and auditing difficult.
+AI agent platforms depend on many credentials: model endpoints, search services, container registries, enterprise APIs, MCP servers, databases, and certificates. Without a clear secrets strategy, these credentials spread across code, container images, environment variables, and pipelines, which increases the risk of leakage and makes rotation and auditing difficult.
 
-This ADR decides that **Azure Key Vault is the single, central service for storing and governing secrets, keys, and certificates** in agent platforms, and that workloads access it exclusively through **Microsoft Entra ID managed identities** and **Azure RBAC**.
+Several solutions exist to manage secrets (environment variables, Container Apps secrets, Kubernetes Secrets, HashiCorp Vault, CI/CD secrets, Azure Key Vault). After comparing them, this ADR makes **one decision: use Azure Key Vault as the single, central service for storing and governing secrets, keys, and certificates** in agent platforms, with access exclusively through **Microsoft Entra ID managed identities** and **Azure RBAC**.
 
 The guiding rule is: **eliminate secrets where possible, and centrally protect the ones that remain.**
 
@@ -15,8 +15,9 @@ The reference architecture separates the **Control Plane** (backend API, identit
 
 Agent workloads typically need to reach:
 
-- Azure OpenAI
+- Microsoft Foundry (Models), including Azure OpenAI models
 - Azure AI Search
+- Azure Container Registry (to pull agent and tool container images)
 - Azure Cosmos DB, Azure SQL Database, Azure Storage
 - Internal enterprise APIs and SaaS platforms
 - MCP servers and external tools
@@ -32,23 +33,74 @@ Agents also process **untrusted prompts** and invoke tools, so any credential re
 - There is no central audit trail of who accessed which secret and when.
 - Long-lived shared credentials increase the blast radius of a compromise.
 
+### Decision drivers
+
+The solution must satisfy these criteria:
+
+- No credentials embedded in code, images, or pipelines.
+- Central governance and audit trail.
+- Fine-grained, least-privilege access control.
+- Support for rotation and expiry.
+- Native integration with Azure identity and the services listed above.
+- Low operational overhead.
+
+---
+
+## Options Considered
+
+| Option | Advantages | Limitations |
+|--------|------------|-------------|
+| **Option 1: Environment variables / app settings** | Simple | Visible to anyone with runtime or configuration access, no central rotation, weak audit trail |
+| **Option 2: Container Apps secrets only** | Built in, easy | Scoped per app, not a central governance point, limited rotation and audit capabilities |
+| **Option 3: Kubernetes Secrets** | Familiar to Kubernetes teams | Only base64 encoded by default, weaker central auditing, not applicable to all Azure services in this architecture |
+| **Option 4: HashiCorp Vault** | Powerful, cloud-agnostic | Additional infrastructure to operate and secure, less native integration with Azure identity and services |
+| **Option 5: CI/CD pipeline secrets (for example GitHub Secrets)** | Good for build-time use | Intended for pipelines, not runtime workloads |
+| **Option 6: Azure Key Vault with managed identities and Azure RBAC** | Central store, Entra ID authentication, RBAC, soft delete and purge protection, private endpoints, audit logs, rotation support, native Azure integration | Runtime dependency, added cost and setup complexity, throttling limits to handle |
+
+### Evaluation against the decision drivers
+
+| Driver | Opt. 1 | Opt. 2 | Opt. 3 | Opt. 4 | Opt. 5 | Opt. 6 |
+|--------|:------:|:------:|:------:|:------:|:------:|:------:|
+| No embedded credentials | No | Partial | Partial | Yes | Partial | Yes |
+| Central governance and audit | No | Limited | Limited | Yes | Limited | Yes |
+| Least-privilege access control | No | Limited | Partial | Yes | Limited | Yes |
+| Rotation and expiry | No | Limited | No | Yes | Limited | Yes |
+| Native Azure integration | Partial | Yes | Partial | Limited | Limited | Yes |
+| Low operational overhead | Yes | Yes | Partial | No | Yes | Yes |
+
 ---
 
 ## Decision
 
-We will use **Azure Key Vault** as the authoritative store for all secrets, cryptographic keys, and certificates used by agent platforms, following the rules below.
+**Option 6: Azure Key Vault** as the authoritative store for all secrets, cryptographic keys, and certificates used by agent platforms. Workloads access it through **managed identities** and **Azure RBAC**.
 
-### Decision 1: Prefer identity over secrets
+Azure Key Vault is the only option that meets all the decision drivers: it centralizes secrets, removes embedded credentials, provides fine-grained access control and a full audit trail, and integrates natively with Microsoft Entra ID and the Azure services used by the platform.
 
-Wherever an Azure service supports Microsoft Entra ID authentication, workloads authenticate with **managed identities** and Azure RBAC, so no secret exists at all. Key Vault is used for the credentials that cannot be replaced by identity, such as third-party API keys, tokens for external tools and MCP servers, and certificates.
+Container Apps secrets (Option 2) may still be used, but only as references to Key Vault secrets, not as a standalone store.
 
-### Decision 2: Access through managed identities only
+---
+
+## Implementation Rules for the Chosen Solution
+
+The following rules define how Azure Key Vault must be used.
+
+### Rule 1: Prefer identity over secrets
+
+Wherever an Azure service supports Microsoft Entra ID authentication, workloads authenticate with **managed identities** and Azure RBAC, so no secret exists at all. Examples:
+
+- Microsoft Foundry (Models) and Azure OpenAI: Entra ID authentication instead of API keys.
+- Azure Container Registry: image pull with a managed identity (AcrPull role) instead of the admin user or registry passwords.
+- Azure Cosmos DB, Azure Storage, Azure AI Search: Entra ID and RBAC where supported.
+
+Key Vault is used for the credentials that cannot be replaced by identity, such as third-party API keys, tokens for external tools and MCP servers, and certificates.
+
+### Rule 2: Access through managed identities only
 
 - Workloads reach Key Vault using **system-assigned or user-assigned managed identities**.
 - No Key Vault credentials, client secrets, or connection strings are stored in code, images, or pipelines.
 - Each workload gets its **own identity**, to keep ownership and audit boundaries clear.
 
-### Decision 3: Authorize with Azure RBAC and least privilege
+### Rule 3: Authorize with Azure RBAC and least privilege
 
 - Use the **Azure RBAC** permission model for Key Vault instead of legacy access policies.
 - Grant the narrowest built-in role at the narrowest scope (vault or individual secret), for example:
@@ -62,7 +114,7 @@ Wherever an Azure service supports Microsoft Entra ID authentication, workloads 
 
 - Human access to production vaults should be exceptional, time-bound (for example via Privileged Identity Management), and audited.
 
-### Decision 4: Keep secrets in the control plane
+### Rule 4: Keep secrets in the control plane
 
 Consistent with the Session Pools architecture:
 
@@ -70,36 +122,36 @@ Consistent with the Session Pools architecture:
 - **Session containers (execution plane)** must not receive broad vault access. Where a session needs a credential, it receives only a **scoped, short-lived** credential, or uses a tightly scoped managed identity where supported.
 - Credentials must **never be generated or persisted inside sessions**, since sessions are ephemeral and not trusted.
 
-### Decision 5: Isolate vaults by environment and sensitivity
+### Rule 5: Isolate vaults by environment and sensitivity
 
 - Use **separate vaults per environment** (development, test, production).
 - Consider separate vaults for different workloads or sensitivity levels so that a single RBAC mistake cannot expose everything.
 
-### Decision 6: Protect against loss and deletion
+### Rule 6: Protect against loss and deletion
 
 - Keep **soft delete** enabled and enable **purge protection** on production vaults.
 - Note that purge protection cannot be turned off once enabled, so confirm the retention period before enabling it.
 
-### Decision 7: Restrict the network path
+### Rule 7: Restrict the network path
 
 - Use **Private Endpoints** (Azure Private Link) and disable public network access for production vaults.
 - Configure private DNS so workloads resolve the vault to its private address.
 - Where public access is unavoidable (for example in development), restrict it with firewall rules.
 
-### Decision 8: Rotate and expire secrets
+### Rule 8: Rotate and expire secrets
 
 - Define **expiration dates** and a **rotation policy** for every secret, key, and certificate.
 - Use Key Vault's automated rotation for keys and certificates where available.
-- For secrets, automate rotation by reacting to Key Vault events with automation such as Azure Functions.
+- For secrets, automate rotation by reacting to Key Vault events (for example near-expiry notifications through Azure Event Grid) with automation such as Azure Functions.
 - Design applications to **reload secrets** without redeployment, and to tolerate version changes.
 
-### Decision 9: Audit and monitor
+### Rule 9: Audit and monitor
 
 - Send Key Vault diagnostic logs (audit events) to a **Log Analytics workspace**.
 - Alert on anomalies such as unexpected callers, access from unfamiliar networks, high failure rates, and bulk reads.
 - Include Key Vault health and throttling in the platform's observability dashboards.
 
-### Decision 10: Plan for throttling and availability
+### Rule 10: Plan for throttling and availability
 
 - Key Vault enforces per-vault request limits, so **cache secrets in memory** for a bounded time instead of reading them on every request.
 - Implement retries with backoff and handle temporary unavailability gracefully.
@@ -134,7 +186,8 @@ flowchart LR
     end
 
     subgraph Protected Services
-        AOAI[Azure OpenAI]
+        FOUNDRY[Microsoft Foundry Models]
+        ACR[Azure Container Registry]
         EXT[External APIs / MCP Servers]
     end
 
@@ -145,8 +198,9 @@ flowchart LR
 
     API -->|calls with retrieved credentials| EXT
     API --> POOL
+    POOL -->|image pull via managed identity| ACR
     POOL --> S1
-    S1 -->|identity-based access| AOAI
+    S1 -->|identity-based access| FOUNDRY
 
     KV -->|near-expiry events| EG
     EG --> AUTO
@@ -154,19 +208,6 @@ flowchart LR
 
     KV -->|audit logs| LAW
 ```
-
----
-
-## Alternatives Considered
-
-| Alternative | Advantages | Reasons Not Chosen |
-|-------------|------------|--------------------|
-| **Environment variables / app settings** | Simple | Visible to anyone with runtime or configuration access, no central rotation, weak audit trail |
-| **Container Apps secrets only** | Built in, easy | Scoped per app, not a central governance point, limited rotation and audit capabilities. Best used as a reference to Key Vault rather than a replacement |
-| **Kubernetes Secrets** | Familiar to Kubernetes teams | Only base64 encoded by default, weaker central auditing, not applicable to all Azure services in this architecture |
-| **HashiCorp Vault** | Powerful, cloud-agnostic | Additional infrastructure to operate and secure, less native integration with Azure identity and services |
-| **CI/CD pipeline secrets (for example GitHub Secrets)** | Good for build-time use | Intended for pipelines, not runtime workloads |
-| **Access policies instead of RBAC** | Legacy model | RBAC provides consistent Azure-wide authorization, finer scope, and better governance |
 
 ---
 
@@ -223,6 +264,7 @@ flowchart LR
 ### Anti-Patterns to Avoid
 
 - Storing secrets in environment variables when Key Vault or identity-based access is possible.
+- Using registry admin credentials instead of managed identity for Azure Container Registry.
 - Sharing one vault and one identity across all environments.
 - Granting `Key Vault Administrator` to applications.
 - Reading secrets on every request without caching.
@@ -243,7 +285,9 @@ This decision supports Zero-Trust principles:
 
 ## Key Takeaways
 
-Prefer managed identity over secrets wherever the service supports it.
+Compare the available options, then decide once: Azure Key Vault is the chosen solution.
+
+Prefer managed identity over secrets wherever the service supports it, including Microsoft Foundry Models and Azure Container Registry.
 
 Use Azure Key Vault as the single source of truth for remaining secrets, keys, and certificates.
 
